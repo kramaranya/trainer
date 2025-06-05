@@ -44,6 +44,7 @@ class DockerJobRunner(JobRunner):
         num_nodes: int,
         framework: types.Framework,
         runtime_name: str,
+        initializer: Optional[types.Initializer] = None,
     ) -> str:
         """Creates a training job.
 
@@ -54,6 +55,7 @@ class DockerJobRunner(JobRunner):
             num_nodes: The number of nodes to run the job on.
             framework: The framework being used.
             runtime_name: The name of the runtime being used.
+            initializer: Configuration for dataset and model initialization.
 
         Returns:
             The name of the created job.
@@ -77,7 +79,32 @@ class DockerJobRunner(JobRunner):
             },
         )
 
+        shared_volume = None
+        if initializer:
+            shared_volume = self.docker_client.volumes.create(
+                name=f"{train_job_name}-workspace",
+                labels={
+                    constants.CONTAINER_TRAIN_JOB_NAME_LABEL: train_job_name,
+                    constants.CONTAINER_RUNTIME_LABEL: runtime_name,
+                },
+            )
+
+        if initializer:
+            self._run_initializers(
+                train_job_name,
+                shared_volume.name,
+                docker_network.name,
+                runtime_name,
+                initializer,
+            )
+
         for i in range(num_nodes):
+            volume_mounts = {}
+            if shared_volume:
+                volume_mounts = {
+                    shared_volume.name: {"bind": constants.WORKSPACE_PATH, "mode": "rw"}
+                }
+
             self.docker_client.containers.run(
                 name=f"{train_job_name}-{i}",
                 network=docker_network.id,
@@ -95,10 +122,122 @@ class DockerJobRunner(JobRunner):
                     num_nodes=num_nodes,
                     node_rank=i,
                 ),
+                volumes=volume_mounts,
                 detach=True,
             )
 
         return train_job_name
+
+    def _run_initializers(
+        self,
+        job_name: str,
+        volume_name: str,
+        network_name: str,
+        runtime_name: str,
+        initializer: types.Initializer,
+    ) -> None:
+        """Run dataset and model initializers before training containers.
+
+        Args:
+            job_name: The name of the training job.
+            volume_name: The name of the shared Docker volume.
+            network_name: The name of the Docker network.
+            runtime_name: The name of the runtime being used.
+            initializer: The initializer configuration.
+        """
+        if initializer.dataset:
+            print(f"Running dataset initializer for job: {job_name}")
+            self._run_dataset_initializer(
+                job_name, volume_name, network_name, runtime_name, initializer.dataset
+            )
+
+        if initializer.model:
+            print(f"Running model initializer for job: {job_name}")
+            self._run_model_initializer(
+                job_name, volume_name, network_name, runtime_name, initializer.model
+            )
+
+    def _run_dataset_initializer(
+        self,
+        job_name: str,
+        volume_name: str,
+        network_name: str,
+        runtime_name: str,
+        dataset_config: types.HuggingFaceDatasetInitializer,
+    ) -> None:
+        """Run the dataset initializer container.
+
+        Args:
+            job_name: The name of the training job.
+            volume_name: The name of the shared Docker volume.
+            network_name: The name of the Docker network.
+            runtime_name: The name of the runtime being used.
+            dataset_config: The dataset initializer configuration.
+        """
+        env_vars = {
+            "STORAGE_URI": dataset_config.storage_uri,
+        }
+
+        if dataset_config.access_token:
+            env_vars["ACCESS_TOKEN"] = dataset_config.access_token
+
+        container_name = f"{job_name}-dataset-initializer"
+
+        self.docker_client.containers.run(
+            name=container_name,
+            image="docker.io/kubeflow/dataset-initializer:latest",
+            environment=env_vars,
+            volumes={volume_name: {"bind": constants.WORKSPACE_PATH, "mode": "rw"}},
+            network=network_name,
+            labels={
+                constants.CONTAINER_TRAIN_JOB_NAME_LABEL: job_name,
+                constants.CONTAINER_RUNTIME_LABEL: runtime_name,
+            },
+            detach=False,
+            remove=True,
+        )
+        print(f"Dataset initializer completed successfully for job: {job_name}")
+
+    def _run_model_initializer(
+        self,
+        job_name: str,
+        volume_name: str,
+        network_name: str,
+        runtime_name: str,
+        model_config: types.HuggingFaceModelInitializer,
+    ) -> None:
+        """Run the model initializer container.
+
+        Args:
+            job_name: The name of the training job.
+            volume_name: The name of the shared Docker volume.
+            network_name: The name of the Docker network.
+            runtime_name: The name of the runtime being used.
+            model_config: The model initializer configuration.
+        """
+        env_vars = {
+            "STORAGE_URI": model_config.storage_uri,
+        }
+
+        if model_config.access_token:
+            env_vars["ACCESS_TOKEN"] = model_config.access_token
+
+        container_name = f"{job_name}-model-initializer"
+
+        self.docker_client.containers.run(
+            name=container_name,
+            image="docker.io/kubeflow/model-initializer:latest",
+            environment=env_vars,
+            volumes={volume_name: {"bind": constants.WORKSPACE_PATH, "mode": "rw"}},
+            network=network_name,
+            labels={
+                constants.CONTAINER_TRAIN_JOB_NAME_LABEL: job_name,
+                constants.CONTAINER_RUNTIME_LABEL: runtime_name,
+            },
+            detach=False,
+            remove=True,
+        )
+        print(f"Model initializer completed successfully for job: {job_name}")
 
     def get_job(self, job_name: str) -> types.ContainerJob:
         """Get a specified container training job by its name.
@@ -211,6 +350,13 @@ class DockerJobRunner(JobRunner):
         for c in containers:
             c.remove(force=True)
             print(f"Removed container: {c.name}")
+
+        volumes = self.docker_client.volumes.list(
+            filters={"label": f"{constants.CONTAINER_TRAIN_JOB_NAME_LABEL}={job_name}"}
+        )
+        for volume in volumes:
+            volume.remove(force=True)
+            print(f"Removed volume: {volume.name}")
 
         network = self.docker_client.networks.get(job_name)
         network.remove()

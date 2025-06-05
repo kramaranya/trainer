@@ -29,6 +29,7 @@ class JobRunner(ABC):
         num_nodes: int,
         framework: types.Framework,
         runtime_name: str,
+        initializer: Optional[types.Initializer] = None,
     ) -> str:
         pass
 
