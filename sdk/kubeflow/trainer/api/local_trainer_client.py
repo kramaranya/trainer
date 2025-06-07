@@ -148,6 +148,7 @@ class LocalTrainerClient(AbstractTrainerClient):
             num_nodes=num_nodes,
             framework=runtime.trainer.framework,
             runtime_name=runtime.name,
+            initializer=initializer,
         )
         return train_job_name
 
